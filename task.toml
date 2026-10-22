@@ -1,0 +1,21 @@
+schema_version = "1.3"
+allow_internet = true
+
+[task]
+name = "local/courier-batch-dispatch-audit"
+authors = [{ name = "xyj" }]
+difficulty = "hard"
+
+[agent]
+entrypoint = "solution/solve.sh"
+
+[environment]
+dockerfile = "environment/Dockerfile"
+network_mode = "public"
+
+[verifier]
+entrypoint = "tests/test.sh"
+
+[metadata]
+tags = ["last-mile-delivery", "dispatch", "scheduling", "fairness", "operations-research"]
+description = "Repair an exact global courier batch optimizer with lexicographic objectives, route/capacity feasibility, bounded urgent fairness overrides, strict validation, and atomic reporting."
