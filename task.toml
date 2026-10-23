@@ -8,8 +8,8 @@ authors = [{ name = "xyj" }]
 keywords = ["last-mile-delivery", "operations-research", "scheduling", "battery-reserve", "service-debt", "python"]
 
 [agent]
-entrypoint = "solution/solve.sh"
 timeout_sec = 3600
+user = "agent"
 # Harbor Codex bootstrap installs its fixed CLI/runtime prerequisites before the agent starts.
 # Candidate code, the verifier, and all task I/O remain offline.
 network_mode = "public"
@@ -21,12 +21,15 @@ cpus = 1
 memory_mb = 2048
 storage_mb = 4096
 gpus = 0
+# Root-level compatibility flag plus the current semantic network policy.
+allow_internet = true
 # Public only for Harbor agent bootstrap; verifier overrides this to hermetic no-network.
 network_mode = "public"
 
 [verifier]
-entrypoint = "tests/test.sh"
 timeout_sec = 1800
+user = "root"
+environment_mode = "shared"
 network_mode = "no-network"
 
 [metadata]

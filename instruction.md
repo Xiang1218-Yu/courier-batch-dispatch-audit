@@ -1,6 +1,6 @@
 # 同城配送多批次全局派单审计
 
-修复 `environment/dispatch_audit` 中的 Python 程序：
+修复当前工作目录中的 `dispatch_audit` Python 程序：
 
 ```bash
 python3 -m dispatch_audit --input INPUT.json --output OUTPUT.json
@@ -10,7 +10,7 @@ python3 -m dispatch_audit --input INPUT.json --output OUTPUT.json
 
 ## 输入、账本和拒收
 
-输入 JSON 对象必须恰好包含 `max_batch_orders`、`policy`、`couriers`、`orders`、`zone_ledger`。最多 8 笔订单、4 位骑手和 8 个区域账本项。布尔值不能作为数值；缺失或额外字段、重复 ID、非有限数、超出公开范围的值均须拒收。拒收必须非零退出、标准错误以 `INPUT_ERROR:` 开头，并且已有输出文件内容和其目录清单完全不变。
+输入 JSON 对象必须恰好包含 `max_batch_orders`、`policy`、`couriers`、`orders`、`zone_ledger`。`max_batch_orders` 表示单批最多派出的订单数量（取值 1–8），不是输入订单数上限；输入订单最多 8 笔、骑手最多 4 位、区域账本最多 8 项。布尔值不能作为数值；缺失或额外字段、重复 ID、非有限数、超出公开范围的值均须拒收。拒收必须非零退出、标准错误以 `INPUT_ERROR:` 开头，并且已有输出文件内容和其目录清单完全不变。
 
 `policy` 恰好包括：`max_zone_share`（(0,1]）、`urgent_slack_minutes`（非负整数）、`max_rush_overrides_per_zone`（0–2）、`debt_dispatch_bonus`（0–3）和 `max_debt_after_batch`（0–12）。每项 `zone_ledger` 恰好有 `zone`、`carried_debt`，并且必须恰好覆盖本批订单出现的区域。
 
@@ -24,7 +24,7 @@ python3 -m dispatch_audit --input INPUT.json --output OUTPUT.json
 
 全局规划顺序先按 `rush`、再按上述债务排序。枚举有限候选方案后，以以下字典序目标选最优：最大化派出加急数；最大化总派出数；最小化最大下一批区域债务；最小化最大骑手累计载重；最小化完成时刻总和；最小化 `assignment_vector`。其中已派元素为 `(0,courier_id)`，未派为 `(1,"")`，按照全局规划顺序比较。
 
-未派订单若区域没有骑手，原因是 `NO_COURIER`，否则是 `OPTIMIZER_DEFERRED`。若最大下一批债务超过 `max_debt_after_batch`，状态为 `DEBT_ALERT`；否则若有未派加急订单为 `ALERT`；否则有未派订单为 `PARTIAL`；全派为 `READY`。
+未派订单若区域没有骑手，原因是 `NO_COURIER`，否则是 `OPTIMIZER_DEFERRED`。`deferred_orders` 每项恰好包含 `id`、`reason` 两个字段，顺序固定为 `id, reason`。若最大下一批债务超过 `max_debt_after_batch`，状态为 `DEBT_ALERT`；否则若有未派加急订单为 `ALERT`；否则有未派订单为 `PARTIAL`；全派为 `READY`。
 
 ## 成功报告
 
