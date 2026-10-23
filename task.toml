@@ -10,8 +10,6 @@ keywords = ["last-mile-delivery", "operations-research", "scheduling", "battery-
 [agent]
 timeout_sec = 3600
 user = "agent"
-# Harbor Codex bootstrap installs its fixed CLI/runtime prerequisites before the agent starts.
-# Candidate code, the verifier, and all task I/O remain offline.
 network_mode = "public"
 
 [environment]
@@ -21,9 +19,7 @@ cpus = 1
 memory_mb = 2048
 storage_mb = 4096
 gpus = 0
-# Root-level compatibility flag plus the current semantic network policy.
 allow_internet = true
-# Public only for Harbor agent bootstrap; verifier overrides this to hermetic no-network.
 network_mode = "public"
 
 [verifier]
@@ -37,4 +33,3 @@ difficulty = "expert"
 category = "operations-research"
 tags = ["last-mile-delivery", "dispatch", "scheduling", "battery-reserve", "service-debt"]
 expert_time_estimate = "4h"
-description = "Repair a deterministic multi-batch courier optimizer with global feasibility, battery reserve, regional debt accounting, strict validation, and atomic reporting."
