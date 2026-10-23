@@ -1,17 +1,18 @@
 import json
 import os
+import pwd
+import signal
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 PROGRAM_DIR = Path(os.environ.get('PROGRAM_DIR', Path(__file__).resolve().parents[1] / 'environment'))
-CANDIDATE_PYTHON = os.environ.get('CANDIDATE_PYTHON', '/usr/local/bin/python3')
-RUNNER = (
-    "import runpy, sys\n"
-    "program = sys.argv[1]\n"
-    "sys.path.insert(0, program)\n"
-    "sys.argv = ['dispatch_audit', *sys.argv[2:]]\n"
-    "runpy.run_module('dispatch_audit', run_name='__main__')\n"
-)
+CANDIDATE_ENTRY = Path(os.environ.get('CANDIDATE_ENTRY', '/app/dispatch_audit/__main__.py'))
+CANDIDATE_WORK_ROOT = os.environ.get('CANDIDATE_WORK_ROOT')
+DROP_CANDIDATE_PRIVILEGES = os.environ.get('VERIFIER_DROP_CANDIDATE_PRIVILEGES') == '1'
+CANDIDATE_TIMEOUT_SECONDS = 20
+CANDIDATE_WORKSPACES = {}
 
 
 def courier(i, zone='north', available=0, capacity=4, route=60, battery=60, reserve=5):
@@ -39,22 +40,82 @@ def payload(*, batch=4, share=1, slack=3, overrides=1, bonus=1, limit=12, courie
 
 
 def invoke(tmp, data):
-    inp = tmp / 'input.json'
-    out = tmp / 'report.json'
-    inp.write_text(json.dumps(data, allow_nan=True))
-    environment = {
-        'PATH': '/usr/local/bin:/usr/bin:/bin',
-        'HOME': str(tmp),
-        'TMPDIR': str(tmp),
-        'PYTHONDONTWRITEBYTECODE': '1',
-        'LANG': 'C.UTF-8',
-    }
-    process = subprocess.run(
-        [CANDIDATE_PYTHON, '-I', '-c', RUNNER, str(PROGRAM_DIR),
-         '--input', str(inp), '--output', str(out)],
-        cwd=tmp, env=environment, capture_output=True, text=True,
-    )
-    return process, out
+    """Run one candidate invocation in an isolated, candidate-owned fixture."""
+    candidate_entry = CANDIDATE_ENTRY
+    # Local developer runs do not mount the container path. In the verifier
+    # container the declared absolute entry above always exists and is used.
+    if not candidate_entry.is_file():
+        candidate_entry = PROGRAM_DIR / 'dispatch_audit' / '__main__.py'
+
+    candidate_tmp = tmp
+    created_candidate_tmp = None
+    if DROP_CANDIDATE_PRIVILEGES and os.geteuid() == 0 and CANDIDATE_WORK_ROOT:
+        # A pytest fixture may invoke the candidate twice to confirm failed
+        # input preserves an existing report. Give that fixture one stable,
+        # agent-owned workspace; separate fixtures still receive distinct ones.
+        fixture_key = str(tmp)
+        candidate_tmp = CANDIDATE_WORKSPACES.get(fixture_key)
+        if candidate_tmp is None:
+            root = Path(CANDIDATE_WORK_ROOT)
+            root.mkdir(mode=0o733, parents=True, exist_ok=True)
+            os.chmod(root, 0o733)
+            candidate_tmp = Path(tempfile.mkdtemp(prefix='case-', dir=root))
+            agent = pwd.getpwnam('agent')
+            os.chown(candidate_tmp, agent.pw_uid, agent.pw_gid)
+            os.chmod(candidate_tmp, 0o700)
+            CANDIDATE_WORKSPACES[fixture_key] = candidate_tmp
+            created_candidate_tmp = candidate_tmp
+
+    try:
+        inp = candidate_tmp / 'input.json'
+        out = candidate_tmp / 'report.json'
+        inp.write_text(json.dumps(data, allow_nan=True))
+        if created_candidate_tmp is not None:
+            # pytest is root-owned but the candidate is agent; make only its
+            # per-invocation input readable in the candidate-owned directory.
+            agent = pwd.getpwnam('agent')
+            os.chown(inp, agent.pw_uid, agent.pw_gid)
+            os.chmod(inp, 0o600)
+        environment = {
+            'PATH': '/usr/local/bin:/usr/bin:/bin',
+            'HOME': str(candidate_tmp),
+            'TMPDIR': str(candidate_tmp),
+            'PYTHONDONTWRITEBYTECODE': '1',
+            'LANG': 'C.UTF-8',
+        }
+        # The verifier venv is root-private. Execute the candidate with the
+        # immutable base interpreter instead, while still exercising its
+        # concrete, replaceable application entrypoint.
+        candidate_command = ['/usr/local/bin/python3', '-I', str(candidate_entry),
+                             '--input', str(inp), '--output', str(out)]
+
+        def drop_candidate_privileges():
+            if not DROP_CANDIDATE_PRIVILEGES or os.geteuid() != 0:
+                return
+            agent = pwd.getpwnam('agent')
+            os.setgid(agent.pw_gid)
+            os.setuid(agent.pw_uid)
+
+        process = subprocess.Popen(
+            candidate_command, cwd=candidate_tmp, env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True, preexec_fn=drop_candidate_privileges,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=CANDIDATE_TIMEOUT_SECONDS)
+            completed = subprocess.CompletedProcess(candidate_command, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            completed = subprocess.CompletedProcess(
+                candidate_command, 124, stdout or '', (stderr or '') + 'CANDIDATE_TIMEOUT\n',
+            )
+        return completed, out
+    finally:
+        # Preserve the report until the caller has consumed it. The verifier's
+        # root-owned cleanup removes the complete candidate workspace later.
+        # Keeping this directory avoids a candidate-controlled race during read.
+        pass
 
 
 def test_global_reserves_scarce_courier_for_rush(tmp_path):

@@ -29,7 +29,7 @@ environment_mode = "shared"
 network_mode = "no-network"
 
 [metadata]
-difficulty = "expert"
+difficulty = "hard"
 category = "operations-research"
 tags = ["last-mile-delivery", "dispatch", "scheduling", "battery-reserve", "service-debt"]
 expert_time_estimate = "4h"

@@ -1,34 +1,42 @@
 #!/bin/sh
 set -eu
 umask 077
+PATH=/usr/local/bin:/usr/bin:/bin
+export PATH
+
+TRUSTED_PYTHON=/usr/local/bin/python3
+if [ ! -x "$TRUSTED_PYTHON" ]; then
+    printf '%s\n' 'trusted verifier runtime is unavailable' >&2
+    exit 0
+fi
 
 TESTS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$TESTS_DIR" = "/tests" ]; then
     BASE_DIR=/logs/verifier
-    REWARD_FILE=${REWARD_FILE:-$BASE_DIR/reward.txt}
-    PROGRAM_DIR=${PROGRAM_DIR:-/app}
+    REWARD_FILE=$BASE_DIR/reward.txt
+    PROGRAM_DIR=/app
 else
     BASE_DIR=$(CDPATH= cd -- "$TESTS_DIR/.." && pwd)
     REWARD_FILE=${REWARD_FILE:-$BASE_DIR/reward.txt}
     PROGRAM_DIR=${PROGRAM_DIR:-$BASE_DIR/environment}
 fi
-CANDIDATE_PYTHON=${CANDIDATE_PYTHON:-$(command -v python3)}
-export PROGRAM_DIR CANDIDATE_PYTHON
+# The candidate is the concrete application entrypoint; the verifier interpreter is never a candidate-controlled entry.
+export PROGRAM_DIR
 
-mkdir -p "$BASE_DIR" "$(dirname -- "$REWARD_FILE")"
+/bin/mkdir -p "$BASE_DIR" "$(dirname -- "$REWARD_FILE")"
+/bin/chmod 0700 "$BASE_DIR"
 
 write_reward() {
-    python3 - "$REWARD_FILE" "$1" <<'PY'
+    "$TRUSTED_PYTHON" - "$REWARD_FILE" "$1" <<'PY'
 import os
 import sys
 import tempfile
-
 path, value = sys.argv[1:3]
 directory = os.path.dirname(os.path.abspath(path)) or "."
-fd, temporary = tempfile.mkstemp(prefix=".reward-", dir=directory)
+fd, temporary = tempfile.mkstemp(prefix='.reward-', dir=directory)
 try:
-    with os.fdopen(fd, "w", encoding="ascii") as stream:
-        stream.write(value + "\n")
+    with os.fdopen(fd, 'w', encoding='ascii') as stream:
+        stream.write(value + '\n')
         stream.flush()
         os.fsync(stream.fileno())
     os.chmod(temporary, 0o444)
@@ -40,16 +48,17 @@ except BaseException:
         pass
     raise
 PY
-    chmod 0444 "$REWARD_FILE"
+    /bin/chmod 0444 "$REWARD_FILE"
 }
 
 write_reward 0.000000
-
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/dispatch-verifier.XXXXXX")
+TMP=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/dispatch-verifier.XXXXXX")
+/bin/chmod 0711 "$TMP"
+CANDIDATE_WORK_ROOT="$TMP/candidate-fixtures"
+/bin/mkdir -p "$CANDIDATE_WORK_ROOT"
+/bin/chmod 0733 "$CANDIDATE_WORK_ROOT"
 FINALIZED=0
-cleanup() {
-    rm -rf "$TMP"
-}
+cleanup() { /bin/rm -rf "$TMP"; }
 on_exit() {
     if [ "$FINALIZED" -ne 1 ]; then
         write_reward 0.000000 || true
@@ -58,25 +67,12 @@ on_exit() {
 }
 trap 'on_exit' EXIT
 trap 'FINALIZED=0; exit 130' HUP INT TERM
+export PYTHONDONTWRITEBYTECODE=1 PIP_NO_INDEX=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-export PYTHONDONTWRITEBYTECODE=1
-export PIP_NO_INDEX=1
-export PIP_NO_CACHE_DIR=1
-export PIP_DISABLE_PIP_VERSION_CHECK=1
-
-python3 -m venv "$TMP/venv"
-
-if ! env -i \
-    PATH=/usr/local/bin:/usr/bin:/bin \
-    HOME="$TMP" \
-    TMPDIR="$TMP" \
-    LANG=C.UTF-8 \
-    "$TMP/venv/bin/python" -I -m pip install \
-        --no-index \
-        --find-links "$TESTS_DIR/wheels" \
-        --require-hashes \
-        -r "$TESTS_DIR/requirements-test.txt" \
-        >"$TMP/pip.log" 2>&1
+"$TRUSTED_PYTHON" -m venv "$TMP/venv"
+if ! env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$TMP" TMPDIR="$TMP" LANG=C.UTF-8 \
+    "$TMP/venv/bin/python" -I -m pip install --no-index --find-links "$TESTS_DIR/wheels" \
+    --require-hashes -r "$TESTS_DIR/requirements-test.txt" >"$TMP/pip.log" 2>&1
 then
     cat "$TMP/pip.log"
     FINALIZED=1
@@ -89,51 +85,31 @@ import os
 import signal
 import subprocess
 import sys
-
-mode, timeout_text, test_file, output, status_path, tmp, program_dir, candidate_python = sys.argv[1:9]
-command = [
-    os.path.join(tmp, "venv", "bin", "python"),
-    "-I",
-    "-m",
-    "pytest",
-    "-p",
-    "no:cacheprovider",
-    "-q",
-]
-if mode == "collect":
-    command.extend(["--collect-only", test_file])
+mode, timeout_text, test_file, output, status_path, tmp, program_dir, candidate_work_root = sys.argv[1:9]
+command = [os.path.join(tmp, 'venv', 'bin', 'python'), '-I', '-m', 'pytest', '-p', 'no:cacheprovider', '-q']
+if mode == 'collect':
+    command.extend(['--collect-only', test_file])
 else:
-    command.extend([test_file, "--junitxml=" + os.path.join(tmp, "results.xml")])
+    command.extend([test_file, '--junitxml=' + os.path.join(tmp, 'results.xml')])
 environment = {
-    "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "HOME": tmp,
-    "TMPDIR": tmp,
-    "LANG": "C.UTF-8",
-    "PYTHONDONTWRITEBYTECODE": "1",
-    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-    "PROGRAM_DIR": program_dir,
-    "CANDIDATE_PYTHON": candidate_python,
+    'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': tmp, 'TMPDIR': tmp,
+    'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1',
+    'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1', 'PROGRAM_DIR': program_dir,
+    'CANDIDATE_WORK_ROOT': candidate_work_root, 'VERIFIER_DROP_CANDIDATE_PRIVILEGES': '1',
 }
-with open(output, "wb") as log:
+with open(output, 'wb') as log:
     process = None
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=tmp,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        process = subprocess.Popen(command, cwd=tmp, env=environment, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         return_code = process.wait(timeout=float(timeout_text))
     except subprocess.TimeoutExpired:
         if process is not None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
         return_code = 124
-with open(status_path, "w", encoding="ascii") as stream:
-    stream.write(f"{return_code}\n")
+with open(status_path, 'w', encoding='ascii') as stream:
+    stream.write(f'{return_code}\n')
 PY
 
 run_pytest() {
@@ -141,9 +117,9 @@ run_pytest() {
     timeout_seconds=$2
     output=$3
     status_path=$4
-    python3 "$TMP/run_pytest.py" \
-        "$mode" "$timeout_seconds" "$TESTS_DIR/test_dispatch_audit.py" \
-        "$output" "$status_path" "$TMP" "$PROGRAM_DIR" "$CANDIDATE_PYTHON"
+    "$TRUSTED_PYTHON" "$TMP/run_pytest.py" "$mode" "$timeout_seconds" \
+        "$TESTS_DIR/test_dispatch_audit.py" "$output" "$status_path" "$TMP" \
+        "$PROGRAM_DIR" "$CANDIDATE_WORK_ROOT"
 }
 
 set +e
@@ -196,7 +172,7 @@ case "$PYTEST_STATUS" in
         ;;
 esac
 
-python3 - "$TMP/results.xml" "$TMP/collect.txt" "$REWARD_FILE" <<'PY'
+"$TRUSTED_PYTHON" - "$TMP/results.xml" "$TMP/collect.txt" "$REWARD_FILE" <<'PY'
 import os
 import sys
 import tempfile
