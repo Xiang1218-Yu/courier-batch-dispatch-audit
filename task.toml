@@ -3,19 +3,35 @@ allow_internet = true
 
 [task]
 name = "local/courier-batch-dispatch-audit"
+description = "Repair a deterministic multi-batch courier optimizer with global feasibility, battery reserve, regional debt accounting, strict validation, and atomic reporting."
 authors = [{ name = "xyj" }]
-difficulty = "hard"
+keywords = ["last-mile-delivery", "operations-research", "scheduling", "battery-reserve", "service-debt", "python"]
 
 [agent]
 entrypoint = "solution/solve.sh"
+timeout_sec = 3600
+# Harbor Codex bootstrap installs its fixed CLI/runtime prerequisites before the agent starts.
+# Candidate code, the verifier, and all task I/O remain offline.
+network_mode = "public"
 
 [environment]
 dockerfile = "environment/Dockerfile"
+build_timeout_sec = 900
+cpus = 1
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+# Public only for Harbor agent bootstrap; verifier overrides this to hermetic no-network.
 network_mode = "public"
 
 [verifier]
 entrypoint = "tests/test.sh"
+timeout_sec = 1800
+network_mode = "no-network"
 
 [metadata]
-tags = ["last-mile-delivery", "dispatch", "scheduling", "fairness", "operations-research"]
-description = "Repair an exact global courier batch optimizer with lexicographic objectives, route/capacity feasibility, bounded urgent fairness overrides, strict validation, and atomic reporting."
+difficulty = "expert"
+category = "operations-research"
+tags = ["last-mile-delivery", "dispatch", "scheduling", "battery-reserve", "service-debt"]
+expert_time_estimate = "4h"
+description = "Repair a deterministic multi-batch courier optimizer with global feasibility, battery reserve, regional debt accounting, strict validation, and atomic reporting."

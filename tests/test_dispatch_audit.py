@@ -1,140 +1,69 @@
-import copy
-import json
-import math
-import os
-import subprocess
-import sys
+import copy,json,math,os,subprocess,sys
+from pathlib import Path
+PROGRAM_DIR=Path(os.environ.get('PROGRAM_DIR',Path(__file__).resolve().parents[1]/'environment'))
 
-PROGRAM_DIR=os.environ["PROGRAM_DIR"]
+def courier(i,zone='north',available=0,capacity=4,route=60,battery=60,reserve=5): return {'id':i,'zone':zone,'available_at_min':available,'capacity_orders':capacity,'max_route_minutes':route,'battery_minutes':battery,'reserve_battery_minutes':reserve}
+def order(i,zone='north',deadline=50,travel=10,load=1,level='standard',created=0,ready=0,energy=10): return {'id':i,'zone':zone,'created_at_min':created,'prep_ready_at_min':ready,'promised_by_min':deadline,'travel_minutes':travel,'load':load,'service_level':level,'energy_minutes':energy}
+def payload(*,batch=4,share=1,slack=3,overrides=1,bonus=1,limit=12,couriers=None,orders=None,ledger=None):
+ orders=orders or [order('o')]; zones=sorted({o['zone'] for o in orders})
+ return {'max_batch_orders':batch,'policy':{'max_zone_share':share,'urgent_slack_minutes':slack,'max_rush_overrides_per_zone':overrides,'debt_dispatch_bonus':bonus,'max_debt_after_batch':limit},'couriers':couriers or [courier('c')],'orders':orders,'zone_ledger':ledger if ledger is not None else [{'zone':z,'carried_debt':0} for z in zones]}
+def run(tmp,data):
+ inp=tmp/'input.json'; out=tmp/'report.json'; inp.write_text(json.dumps(data,allow_nan=True)); p=subprocess.run([sys.executable,'-m','dispatch_audit','--input',str(inp),'--output',str(out)],cwd=PROGRAM_DIR,capture_output=True,text=True); return p,out
+def decoded(tmp,data):
+ p,out=run(tmp,data); assert p.returncode==0,p.stderr; return json.loads(out.read_text()),out
 
-def courier(ident, *, zone="north", available=0, capacity=4, route=60):
-    return {"id":ident,"zone":zone,"available_at_min":available,"capacity_orders":capacity,"max_route_minutes":route}
-
-def order(ident, *, zone="north", deadline=40, travel=10, load=1, level="standard", created=0, ready=0):
-    return {"id":ident,"zone":zone,"created_at_min":created,"prep_ready_at_min":ready,"promised_by_min":deadline,"travel_minutes":travel,"load":load,"service_level":level}
-
-def payload(*, batch=4, share=.5, slack=3, overrides=1, couriers=None, orders=None):
-    return {"max_batch_orders":batch,"policy":{"max_zone_share":share,"urgent_slack_minutes":slack,"max_rush_overrides_per_zone":overrides},"couriers":couriers or [courier("c")],"orders":orders or [order("o")]}
-
-def decoded(tmp_path, data):
-    inp=tmp_path/"input.json"; out=tmp_path/"report.json"
-    inp.write_text(json.dumps(data),encoding="utf-8")
-    run=subprocess.run([sys.executable,"-m","dispatch_audit","--input",str(inp),"--output",str(out)],cwd=PROGRAM_DIR,capture_output=True,text=True)
-    assert run.returncode==0,run.stderr
-    return json.loads(out.read_text(encoding="utf-8")),out
-
-def test_global_optimizer_reserves_scarce_courier_for_later_rush(tmp_path):
-    """O1：局部最快选择 a 会堵死后续加急；全局解必须把 flex 分给 b。"""
-    data=payload(batch=2,share=1,couriers=[courier("a",available=0),courier("b",available=5)],orders=[order("flex",deadline=30,level="rush"),order("scarce",deadline=12,level="rush",ready=0)])
-    # b cannot serve scarce by 12, but can serve flex; a must remain for scarce.
-    report,_=decoded(tmp_path,data)
-    by_id={x["id"]:x["courier_id"] for x in report["dispatched_orders"]}
-    assert by_id=={"scarce":"a","flex":"b"} and report["optimization"]["rush_dispatched"]==2
-
-def test_global_optimizer_maximizes_rush_before_more_standard_orders(tmp_path):
-    """O2：一个加急的优先级高于多个常规订单，不能只最大化订单数量。"""
-    data=payload(batch=2,share=1,couriers=[courier("a",capacity=2)],orders=[order("rush",deadline=10,travel=10,load=2,level="rush"),order("std-a",deadline=30,load=1),order("std-b",deadline=40,load=1)])
-    report,_=decoded(tmp_path,data)
-    assert [x["id"] for x in report["dispatched_orders"]]==["rush"]
-    assert report["optimization"]["rush_dispatched"]==1 and report["optimization"]["total_dispatched"]==1
-
-def test_global_optimizer_minimizes_peak_load_after_dispatch_count(tmp_path):
-    """O3：即使集中给快骑手会降低总完成时刻，也必须先最小化最大骑手载荷。"""
-    data=payload(batch=2,share=1,couriers=[courier("fast",capacity=4,available=0),courier("slow",capacity=4,available=20)],orders=[order("one",load=2,deadline=40),order("two",deadline=50,load=2)])
-    report,_=decoded(tmp_path,data)
-    # 集中给 fast 的总完成时间更小（30），但峰值载荷为 4；规范目标要求先选峰值 2 的分配。
-    assert report["optimization"]["max_courier_assigned_load"]==2
-    assert {x["courier_id"] for x in report["dispatched_orders"]}=={"fast","slow"}
-    assert report["optimization"]["total_completion_min"]==40
-
-def test_global_optimizer_minimizes_total_completion_before_canonical_tiebreak(tmp_path):
-    """O4：最大载荷同分时，以总完成时刻而非输入顺序决定计划。"""
-    data=payload(batch=3,share=1,couriers=[courier("slow",available=10),courier("fast",available=0)],orders=[order("one",deadline=60),order("two",deadline=70),order("three",deadline=80)])
-    report,_=decoded(tmp_path,data)
-    # 三笔、两位骑手时最小峰值载荷为 2；在该前提下 fast 承担前两笔才使总完成时间最小。
-    assert report["optimization"]["max_courier_assigned_load"]==2
-    assert report["optimization"]["total_completion_min"]==50
-    assert [x["courier_id"] for x in report["dispatched_orders"]]==["fast","fast","slow"]
-
-def test_canonical_assignment_vector_breaks_perfect_tie(tmp_path):
-    """O5：所有数值目标同分时使用题设 assignment_vector，选择字典序较小骑手。"""
-    data=payload(batch=1,share=1,couriers=[courier("z"),courier("a")],orders=[order("x")])
-    report,_=decoded(tmp_path,data)
-    assert report["dispatched_orders"]==[{"id":"x","courier_id":"a","zone":"north","start_min":0.0,"completion_min":10.0,"slack_min":30.0,"fairness_override":False}]
-
-def test_fairness_cap_allows_only_imminent_bounded_rush_override(tmp_path):
-    """O6：超限加急需同时满足余量阈值和区域豁免额度。"""
-    data=payload(batch=4,share=.5,slack=2,overrides=1,orders=[order("r1",deadline=10,level="rush"),order("r2",deadline=20,level="rush"),order("r3",deadline=32,level="rush"),order("r4",deadline=42,level="rush")])
-    report,_=decoded(tmp_path,data)
-    assert [x["id"] for x in report["dispatched_orders"]]==["r1","r2","r3"]
-    assert report["dispatched_orders"][-1]["fairness_override"] is True
-    assert report["deferred_orders"]==[{"id":"r4","reason":"OPTIMIZER_DEFERRED"}]
-
-def test_zone_cap_can_force_cross_zone_global_tradeoff(tmp_path):
-    """O7：区域普通上限约束参与全局最优，空余批次位不能非法填满单一区域。"""
-    data=payload(batch=3,share=.5,couriers=[courier("n",zone="north"),courier("s",zone="south")],orders=[order("n1"),order("n2",deadline=50),order("n3",deadline=60),order("s1",zone="south",deadline=70)])
-    report,_=decoded(tmp_path,data)
-    assert [x["id"] for x in report["dispatched_orders"]]==["n1","n2","s1"]
-    assert report["zones"]==[{"zone":"north","dispatched_count":2,"fairness_cap":2,"rush_overrides":0},{"zone":"south","dispatched_count":1,"fairness_cap":2,"rush_overrides":0}]
-
-def test_route_sequence_can_make_a_plan_infeasible(tmp_path):
-    """O8：同一骑手按全局顺序累积路线；不能把各订单独立地判为可行。"""
-    data=payload(batch=2,share=1,couriers=[courier("a",route=15)],orders=[order("first",deadline=10,travel=8),order("later",deadline=16,travel=8)])
-    report,_=decoded(tmp_path,data)
-    assert [x["id"] for x in report["dispatched_orders"]]==["first"]
-    assert report["deferred_orders"]==[{"id":"later","reason":"OPTIMIZER_DEFERRED"}]
-
-def test_no_courier_is_distinguished_from_optimizer_deferral(tmp_path):
-    """O9：只有无同区骑手使用 NO_COURIER；其余未选用全局延后原因。"""
-    data=payload(couriers=[courier("n")],orders=[order("missing",zone="south",level="rush"),order("present")])
-    report,_=decoded(tmp_path,data)
-    assert report["status"]=="ALERT"
-    assert report["deferred_orders"]==[{"id":"missing","reason":"NO_COURIER"}]
-
-def test_reordered_input_produces_identical_bytes(tmp_path):
-    """O10：输入数组重排不得改变搜索结果或紧凑 JSON 字节。"""
-    base=payload(batch=3,share=1,couriers=[courier("b"),courier("a")],orders=[order("b",deadline=50),order("a",deadline=40),order("r",deadline=20,level="rush")])
-    _,first=decoded(tmp_path,base)
-    changed=copy.deepcopy(base); changed["couriers"].reverse(); changed["orders"].reverse()
-    _,second=decoded(tmp_path,changed)
-    assert first.read_bytes()==second.read_bytes()
-
-def test_report_schema_order_and_compact_newline(tmp_path):
-    """O11：所有公开字段顺序、紧凑 JSON 和末尾换行均受契约约束。"""
-    report,out=decoded(tmp_path,payload())
-    raw=out.read_bytes()
-    assert raw.endswith(b"\n") and not raw.endswith(b"\n\n") and b", " not in raw
-    assert list(report)==["status","dispatched_orders","deferred_orders","couriers","zones","optimization"]
-    assert list(report["dispatched_orders"][0])==["id","courier_id","zone","start_min","completion_min","slack_min","fairness_override"]
-    assert list(report["zones"][0])==["zone","dispatched_count","fairness_cap","rush_overrides"]
-
-def assert_rejected_unchanged(tmp_path,data):
-    out=tmp_path/"report.json"; inp=tmp_path/"input.json"
-    out.write_bytes(b"SENTINEL")
-    inp.write_text(json.dumps(data,allow_nan=True),encoding="utf-8")
-    before=sorted(p.name for p in tmp_path.iterdir())
-    run=subprocess.run([sys.executable,"-m","dispatch_audit","--input",str(inp),"--output",str(out)],cwd=PROGRAM_DIR,capture_output=True,text=True)
-    assert run.returncode!=0 and run.stderr.startswith("INPUT_ERROR:")
-    assert out.read_bytes()==b"SENTINEL" and sorted(p.name for p in tmp_path.iterdir())==before
-
-def test_rejects_new_policy_fields_and_planning_limits_without_side_effects(tmp_path):
-    """O12：新增策略字段及枚举规模上限均须严格校验且不改写既有报告。"""
-    wrong=payload(); del wrong["policy"]["max_rush_overrides_per_zone"]
-    assert_rejected_unchanged(tmp_path,wrong)
-    too_many=payload(orders=[order(str(i),deadline=100+i) for i in range(9)])
-    assert_rejected_unchanged(tmp_path,too_many)
-
-def test_rejects_boolean_nonfinite_and_extra_fields_without_side_effects(tmp_path):
-    """O13：布尔伪数值、非有限数和未声明字段都必须被拒收。"""
-    boolean=payload(); boolean["policy"]["max_rush_overrides_per_zone"]=True
-    assert_rejected_unchanged(tmp_path,boolean)
-    nonfinite=payload(); nonfinite["orders"][0]["travel_minutes"]=math.inf
-    assert_rejected_unchanged(tmp_path,nonfinite)
-    extra=payload(); extra["orders"][0]["unexpected"]=1
-    assert_rejected_unchanged(tmp_path,extra)
-
-def test_atomic_success_replaces_sentinel_without_temporary_files(tmp_path):
-    """O14：成功写入须原子替换，不能留下命名临时文件。"""
-    out=tmp_path/"report.json"; out.write_bytes(b"OLD")
-    _,out=decoded(tmp_path,payload())
-    assert out.read_bytes()!=b"OLD" and not [p for p in tmp_path.iterdir() if p.name.startswith(".dispatch-audit-")]
+def test_global_reserves_scarce_courier_for_rush(tmp_path):
+ """F1：全局目标先最大化加急完成数。"""
+ d=payload(batch=2,couriers=[courier('shared'),courier('north',zone='north')],orders=[order('standard'),order('rush',zone='north',deadline=15,level='rush')])
+ r,_=decoded(tmp_path,d); assert {x['id'] for x in r['dispatched_orders']}=={'standard','rush'} and next(x for x in r['dispatched_orders'] if x['id']=='rush')['courier_id']=='north'
+def test_route_sequence_blocks_individually_feasible_order(tmp_path):
+ """F2：路线按规划顺序累积。"""
+ r,_=decoded(tmp_path,payload(batch=2,couriers=[courier('a',route=15)],orders=[order('a',deadline=10,travel=8),order('b',deadline=16,travel=8)])); assert [x['id'] for x in r['dispatched_orders']]==['a']
+def test_rush_fairness_override_is_bounded(tmp_path):
+ """F3：仅紧迫加急可有限突破区域上限。"""
+ r,_=decoded(tmp_path,payload(batch=3,share=.33,slack=5,overrides=1,couriers=[courier('c')],orders=[order('r1',deadline=20,level='rush'),order('r2',deadline=25,level='rush'),order('r3',deadline=40,level='rush')]))
+ assert len(r['dispatched_orders'])==2 and r['zones'][0]['rush_overrides']==1
+def test_energy_reserve_rejects_route_feasible_order(tmp_path):
+ """E1：路线可行但透支电量储备时必须延后。"""
+ r,_=decoded(tmp_path,payload(couriers=[courier('c',battery=15,reserve=5)],orders=[order('a',energy=10),order('b',deadline=70,energy=1)])); assert [x['id'] for x in r['dispatched_orders']]==['a']
+def test_energy_accumulates_across_orders(tmp_path):
+ """E2：电量按骑手接单序列累计。"""
+ r,_=decoded(tmp_path,payload(batch=2,couriers=[courier('c',battery=24,reserve=4)],orders=[order('a',energy=10),order('b',deadline=70,energy=11)])); assert [x['id'] for x in r['dispatched_orders']]==['a']
+def test_rush_cannot_borrow_safety_reserve(tmp_path):
+ """E3：加急订单同样不能突破安全储备。"""
+ r,_=decoded(tmp_path,payload(couriers=[courier('c',battery=10,reserve=5)],orders=[order('r',level='rush',energy=6)])); assert r['status']=='ALERT' and not r['dispatched_orders']
+def test_debt_orders_same_level_priority(tmp_path):
+ """D1：同等级订单按区域历史债务排序。"""
+ d=payload(batch=1,couriers=[courier('n'),courier('s','south')],orders=[order('north'),order('south','south')],ledger=[{'zone':'north','carried_debt':0},{'zone':'south','carried_debt':4}])
+ r,_=decoded(tmp_path,d); assert [x['id'] for x in r['dispatched_orders']]==['south']
+def test_next_debt_is_auditable(tmp_path):
+ """D2：下批债务结合延后订单与派单抵扣计算。"""
+ d=payload(batch=1,bonus=2,couriers=[courier('n')],orders=[order('a'),order('b',deadline=60)],ledger=[{'zone':'north','carried_debt':3}]); r,_=decoded(tmp_path,d); assert r['zones'][0]['next_debt']==2
+def test_debt_alert_precedes_partial(tmp_path):
+ """D3：超出债务警戒线产生独立运营状态。"""
+ d=payload(batch=1,limit=1,couriers=[courier('n')],orders=[order('a'),order('b',deadline=60)],ledger=[{'zone':'north','carried_debt':3}]); r,_=decoded(tmp_path,d); assert r['status']=='DEBT_ALERT'
+def test_debt_goal_precedes_peak_load(tmp_path):
+ """D4：在完成数相同时优先降低最大下一批债务。"""
+ d=payload(batch=2,bonus=1,couriers=[courier('n',capacity=2),courier('s','south',capacity=2)],orders=[order('n1'),order('n2',deadline=60),order('s1','south',deadline=70)],ledger=[{'zone':'north','carried_debt':4},{'zone':'south','carried_debt':0}]); r,_=decoded(tmp_path,d); assert {x['id'] for x in r['dispatched_orders']}=={'n1','n2'}
+def test_canonical_assignment_tiebreak(tmp_path):
+ """F4：等价方案按骑手 ID 给出稳定指派。"""
+ r,_=decoded(tmp_path,payload(couriers=[courier('z'),courier('a')],orders=[order('o')])); assert r['dispatched_orders'][0]['courier_id']=='a'
+def test_reordered_input_bytes_stable(tmp_path):
+ """F5：输入数组重排不得影响报告字节。"""
+ d=payload(batch=2,couriers=[courier('b'),courier('a')],orders=[order('b'),order('a',deadline=40)]); _,x=decoded(tmp_path,d); d['couriers'].reverse(); d['orders'].reverse(); _,y=decoded(tmp_path,d); assert x.read_bytes()==y.read_bytes()
+def test_schema_compact_and_atomic_success(tmp_path):
+ """F6：成功报告字段、紧凑格式和原子替换均固定。"""
+ out=tmp_path/'report.json';out.write_bytes(b'OLD');r,out=decoded(tmp_path,payload()); raw=out.read_bytes(); assert list(r)==['status','dispatched_orders','deferred_orders','couriers','zones','optimization'] and b', ' not in raw and raw.endswith(b'\n') and not list(tmp_path.glob('.dispatch-audit-*'))
+def rejected(tmp,d):
+ out=tmp/'report.json';out.write_bytes(b'SENTINEL'); p,_=run(tmp,d); assert p.returncode and p.stderr.startswith('INPUT_ERROR:') and out.read_bytes()==b'SENTINEL' and sorted(x.name for x in tmp.iterdir())==['input.json','report.json']
+def test_rejects_energy_schema_and_reserve_bounds(tmp_path):
+ """V1：电量字段缺失、额外字段及储备越界均安全拒绝。"""
+ decoded(tmp_path,payload())
+ d=payload();del d['couriers'][0]['battery_minutes'];rejected(tmp_path,d); d=payload();d['couriers'][0]['reserve_battery_minutes']=99;rejected(tmp_path,d);d=payload();d['orders'][0]['x']=1;rejected(tmp_path,d)
+def test_rejects_ledger_coverage_and_nonfinite(tmp_path):
+ """V2：账本必须覆盖订单区域且拒绝非有限数与布尔伪数值。"""
+ decoded(tmp_path,payload())
+ d=payload();d['zone_ledger']=[];rejected(tmp_path,d);d=payload();d['orders'][0]['energy_minutes']=math.inf;rejected(tmp_path,d);d=payload();d['policy']['debt_dispatch_bonus']=True;rejected(tmp_path,d)
+def test_no_courier_reason(tmp_path):
+ """V3：无同区骑手与优化延后原因可区分。"""
+ r,_=decoded(tmp_path,payload(couriers=[courier('n')],orders=[order('s','south',level='rush'),order('n')])); assert r['deferred_orders'][0]=={'id':'s','reason':'NO_COURIER'}

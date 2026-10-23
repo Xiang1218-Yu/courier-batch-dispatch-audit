@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import argparse
-import sys
+
+def solve(payload):
+    raise ValueError("dispatch optimizer has not been implemented")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.parse_args(argv)
-    print("dispatch_audit is not implemented", file=sys.stderr)
+    print("INPUT_ERROR: dispatch optimizer has not been implemented", file=__import__("sys").stderr)
     return 2
 
 
